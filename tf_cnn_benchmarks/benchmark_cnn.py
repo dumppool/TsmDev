@@ -871,43 +871,28 @@ class BenchmarkCNN(object):
       while not done_fn():
         if local_step == 0:
           log_fn('Done warm up')
-          if execution_barrier:
-            log_fn('Waiting for other replicas to finish warm up')
-            assert global_step_watcher.start_time == 0
-            sess.run([execution_barrier])
-
+          
           header_str = 'Step\tImg/sec\tloss'
-          if self.params.print_training_accuracy or self.params.forward_only:
-            header_str += '\ttop_1_accuracy\ttop_5_accuracy'
+          
           log_fn(header_str)
-          assert len(step_train_times) == self.num_warmup_batches
+          
           # reset times to ignore warm up batch
           step_train_times = []
           loop_start_time = time.time()
-        if (summary_writer and
-            (local_step + 1) % self.params.save_summaries_steps == 0):
-          fetch_summary = summary_op
-        else:
-          fetch_summary = None
+        
+        fetch_summary = None
         summary_str = benchmark_one_step(
             sess, fetches, local_step,
             self.batch_size * (self.num_workers if self.single_session else 1),
             step_train_times, self.trace_filename, image_producer, self.params,
             fetch_summary)
-        if summary_str is not None and is_chief:
-          sv.summary_computed(sess, summary_str)
+        
         local_step += 1
       loop_end_time = time.time()
       # Waits for the global step to be done, regardless of done_fn.
-      if global_step_watcher:
-        while not global_step_watcher.done():
-          time.sleep(.25)
-      if self.single_session:
-        num_steps = local_step
-        elapsed_time = loop_end_time - loop_start_time
-      else:
-        num_steps = global_step_watcher.num_steps()
-        elapsed_time = global_step_watcher.elapsed_time()
+      
+      num_steps = global_step_watcher.num_steps()
+      elapsed_time = global_step_watcher.elapsed_time()
 
       average_wall_time = elapsed_time / num_steps if num_steps > 0 else 0
       images_per_sec = ((self.num_workers * self.batch_size) / average_wall_time
@@ -920,16 +905,7 @@ class BenchmarkCNN(object):
       if is_chief:
         store_benchmarks({'total_images_per_sec': images_per_sec}, self.params)
       # Save the model checkpoint.
-      if self.params.train_dir is not None and is_chief:
-        checkpoint_path = os.path.join(self.params.train_dir, 'model.ckpt')
-        if not gfile.Exists(self.params.train_dir):
-          gfile.MakeDirs(self.params.train_dir)
-        sv.saver.save(sess, checkpoint_path, global_step)
-
-      if execution_barrier:
-        # Wait for other workers to reach the end, so this worker doesn't
-        # go away underneath them.
-        sess.run([execution_barrier])
+      
     sv.stop()
     return {
         'num_workers': self.num_workers,
@@ -960,12 +936,6 @@ class BenchmarkCNN(object):
             data_flow_ops.StagingArea(
                 [images_splits[0].dtype, labels_splits[0].dtype],
                 shapes=[images_shape, labels_shape]))
-        for group_index in xrange(self.batch_group_size):
-          if not self.use_synthetic_gpu_images:
-            batch_index = group_index + device_num * self.batch_group_size
-            put_op = image_producer_stages[device_num].put(
-                [images_splits[batch_index], labels_splits[batch_index]])
-            image_producer_ops.append(put_op)
     return (image_producer_ops, image_producer_stages)
 
   def _build_model(self):
@@ -986,21 +956,7 @@ class BenchmarkCNN(object):
 
     with tf.device(self.global_step_device):
       global_step = tf.train.get_or_create_global_step()
-      if self.params.use_fp16:
-        init_loss_scale_val = float(self.params.fp16_loss_scale or
-                                    self.model.get_fp16_loss_scale())
-        if self.enable_auto_loss_scale or init_loss_scale_val != 1:
-          self.loss_scale = tf.get_variable(
-              name='loss_scale',
-              initializer=init_loss_scale_val,
-              dtype=tf.float32,
-              trainable=False)
-          self.loss_scale_normal_steps = tf.get_variable(
-              name='loss_scale_normal_steps', initializer=0, trainable=False)
-        else:
-          self.loss_scale = None
-          self.loss_scale_normal_steps = None
-
+    
     # Build the processing and model for the worker.
     (image_producer_ops,
      image_producer_stages) = self._build_image_processing(shift_ratio=0)
@@ -1018,11 +974,7 @@ class BenchmarkCNN(object):
         if phase_train:
           losses.append(results['loss'])
           device_grads.append(results['gradvars'])
-        else:
-          all_logits.append(results['logits'])
-        if not phase_train or self.params.print_training_accuracy:
-          all_top_1_ops.append(results['top_1_op'])
-          all_top_5_ops.append(results['top_5_op'])
+        
 
         if device_num == 0:
           # Retain the Batch Normalization updates operations only from the
@@ -1037,16 +989,8 @@ class BenchmarkCNN(object):
           # and save the moving averages once.
           update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS, name_scope)
           staging_delta_ops = list(self.variable_mgr.staging_delta_ops)
-
-    if self.variable_mgr.supports_staged_vars():
-      for staging_ops in self.variable_mgr.staging_vars_on_devices:
-        gpu_compute_stage_ops.extend(
-            [put_op for _, (put_op, _) in six.iteritems(staging_ops)])
+    
     enqueue_ops.append(tf.group(*gpu_compute_stage_ops))
-    if gpu_grad_stage_ops:
-      staging_delta_ops += gpu_grad_stage_ops
-    if staging_delta_ops:
-      enqueue_ops.append(tf.group(*(staging_delta_ops)))
 
     fetches = self._build_fetches(global_step, all_logits, losses, device_grads,
                                   enqueue_ops, update_ops, all_top_1_ops,
@@ -1058,19 +1002,7 @@ class BenchmarkCNN(object):
                      phase_train):
     """Complete construction of model graph, populating the fetches map."""
     fetches = {'enqueue_ops': enqueue_ops}
-    if all_top_1_ops:
-      fetches['top_1_accuracy'] = tf.reduce_sum(all_top_1_ops) / self.batch_size
-      if self.task_index == 0 and self.params.summary_verbosity >= 1:
-        tf.summary.scalar('top_1_accuracy', fetches['top_1_accuracy'])
-    if all_top_5_ops:
-      fetches['top_5_accuracy'] = tf.reduce_sum(all_top_5_ops) / self.batch_size
-      if self.task_index == 0 and self.params.summary_verbosity >= 1:
-        tf.summary.scalar('top_5_accuracy', fetches['top_5_accuracy'])
-
-    if not phase_train:
-      if self.params.forward_only:
-        fetches['all_logits'] = tf.concat(all_logits, 0)
-      return fetches
+    
     apply_gradient_devices, gradient_state = (
         self.variable_mgr.preprocess_device_grads(device_grads))
 
@@ -1084,49 +1016,12 @@ class BenchmarkCNN(object):
         learning_rate = (
             self.params.learning_rate or
             self.model.get_learning_rate(global_step, self.batch_size))
-        if ((not self.use_synthetic_gpu_images) and
-            self.params.learning_rate and
-            self.params.num_epochs_per_decay > 0 and
-            self.params.learning_rate_decay_factor > 0):
-          num_batches_per_epoch = (
-              float(self.dataset.num_examples_per_epoch()) / self.batch_size)
-          decay_steps = int(
-              num_batches_per_epoch * self.params.num_epochs_per_decay)
-
-          # Decay the learning rate exponentially based on the number of steps.
-          learning_rate = tf.train.exponential_decay(
-              self.params.learning_rate,
-              global_step,
-              decay_steps,
-              self.params.learning_rate_decay_factor,
-              staircase=True)
-
-          if self.params.minimum_learning_rate != 0.:
-            learning_rate = tf.maximum(learning_rate,
-                                       self.params.minimum_learning_rate)
-
-        if gradient_clip is not None:
-          clipped_grads = [(tf.clip_by_value(grad, -gradient_clip,
-                                             +gradient_clip), var)
-                           for grad, var in avg_grads]
-        else:
-          clipped_grads = avg_grads
+        
+        clipped_grads = avg_grads
 
         learning_rate = tf.identity(learning_rate, name='learning_rate')
-        if self.params.optimizer == 'momentum':
-          opt = tf.train.MomentumOptimizer(
-              learning_rate, self.params.momentum, use_nesterov=True)
-        elif self.params.optimizer == 'sgd':
-          opt = tf.train.GradientDescentOptimizer(learning_rate)
-        elif self.params.optimizer == 'rmsprop':
-          opt = tf.train.RMSPropOptimizer(
-              learning_rate,
-              self.params.rmsprop_decay,
-              momentum=self.params.rmsprop_momentum,
-              epsilon=self.params.rmsprop_epsilon)
-        else:
-          raise ValueError('Optimizer "%s" was not recognized',
-                           self.params.optimizer)
+        opt = tf.train.GradientDescentOptimizer(learning_rate)
+        
 
         loss_scale_params = variable_mgr_util.AutoLossScaleParams(
             enable_auto_loss_scale=self.enable_auto_loss_scale,
@@ -1138,34 +1033,6 @@ class BenchmarkCNN(object):
         self.variable_mgr.append_apply_gradients_ops(
             gradient_state, opt, clipped_grads, training_ops, loss_scale_params)
     train_op = tf.group(*(training_ops + update_ops))
-
-    with tf.device(self.cpu_device):
-      if self.task_index == 0 and self.params.summary_verbosity >= 1:
-        tf.summary.scalar('learning_rate', learning_rate)
-        tf.summary.scalar('total_loss', total_loss)
-        if self.loss_scale is not None:
-          tf.summary.scalar('loss_scale', self.loss_scale)
-          tf.summary.scalar('loss_scale_normal_steps',
-                            self.loss_scale_normal_steps)
-
-        if self.params.summary_verbosity >= 2:
-          # Histogram of log values of all non-zero gradients.
-          all_grads = []
-          for grad, var in avg_grads:
-            all_grads.append(tf.reshape(grad, [-1]))
-          grads = tf.abs(tf.concat(all_grads, 0))
-          # exclude grads with zero values.
-          indices_for_non_zero_grads = tf.where(tf.not_equal(grads, 0))
-          log_grads = tf.reshape(
-              tf.log(tf.gather(grads, indices_for_non_zero_grads)), [-1])
-          tf.summary.histogram('log_gradients', log_grads)
-
-        if self.params.summary_verbosity >= 3:
-          for grad, var in avg_grads:
-            if grad is not None:
-              tf.summary.histogram(var.op.name + '/gradients', grad)
-          for var in tf.trainable_variables():
-            tf.summary.histogram(var.op.name, var)
 
     fetches['train_op'] = train_op
     fetches['total_loss'] = total_loss

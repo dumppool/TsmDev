@@ -14,32 +14,8 @@ utils.build_path(['training/nn'])
 utils.build_path(['training/weights'])
 utils.build_path(['training/model'])
 
-# 定义日志和模型输出的路径。
-MODEL_SAVE_PATH = "logs_and_models/"
-MODEL_NAME = "model.ckpt"
-
-X = np.load('XXX.npy')
-Y = np.load('YYY.npy')
-
-
-print(X.shape)
-print(Y.shape)
-
-
-Xdim    = X.shape[1]
-Ydim    = Y.shape[1]
-samples = X.shape[0]
-
-""" Phase Function Neural Network """
-"""input of nn"""
-#X_nn = tf.placeholder(tf.float32, [None, Xdim], name='x-input')
-#Y_nn = tf.placeholder(tf.float32, [None, Ydim], name='y-input')
-#keep_prob = tf.placeholder(tf.float32)  
-
-
-"""parameter of nn"""
-rng = np.random.RandomState(23456)
-
+##==============================================================================
+##==============================================================================
 
 
     
@@ -101,6 +77,24 @@ def average_gradients(tower_grads):
         average_grads.append(grad_and_var)
     # 返回所有变量的平均梯度，这个将被用于变量的更新。
     return average_grads 
+
+# 定义日志和模型输出的路径。
+MODEL_SAVE_PATH = "logs_and_models/"
+MODEL_NAME = "model.ckpt"
+
+X = np.load('XXX.npy')
+Y = np.load('YYY.npy')
+
+print(X.shape)
+print(Y.shape)
+
+Xdim    = X.shape[1]
+Ydim    = Y.shape[1]
+samples = X.shape[0]
+
+rng = np.random.RandomState(23456)
+
+
 
 #learning_rate      = 0.0001
 weightDecay        = 0.0025

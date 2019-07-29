@@ -697,9 +697,44 @@ class BenchmarkCNN(object):
     self.resize_method = self.params.resize_method
     self.sync_queue_counter = 0
     self.num_gpus = self.params.num_gpus
-    
-    self.gpu_indices = [x for x in range(self.num_gpus)]
+    if self.params.gpu_indices:
+      self.gpu_indices = [int(x) for x in self.params.gpu_indices.split(',')]
+    else:
+      self.gpu_indices = [x for x in range(self.num_gpus)]
     self.use_synthetic_gpu_images = self.dataset.use_synthetic_gpu_images()
+
+    if (self.params.device == 'cpu' and self.params.data_format == 'NCHW' and
+        not self.params.mkl):
+      raise ValueError('device=cpu requires that data_format=NHWC')
+
+    if ((self.params.num_epochs_per_decay or
+         self.params.learning_rate_decay_factor) and
+        not (self.params.learning_rate and self.params.num_epochs_per_decay and
+             self.params.learning_rate_decay_factor)):
+      raise ValueError('If one of num_epochs_per_decay or '
+                       'learning_rate_decay_factor is set, both must be set'
+                       'and learning_rate must be set')
+    if (self.params.minimum_learning_rate and
+        not (self.params.learning_rate and self.params.num_epochs_per_decay and
+             self.params.learning_rate_decay_factor)):
+      raise ValueError('minimum_learning_rate requires learning_rate,'
+                       'num_epochs_per_decay, and '
+                       'learning_rate_decay_factor to be set')
+
+    if (self.params.use_fp16 and self.params.fp16_vars and
+        'replicated' in self.params.variable_update and
+        self.params.all_reduce_spec and 'nccl' in self.params.all_reduce_spec):
+      raise ValueError('fp16 variables are not supported with NCCL')
+
+    if self.params.use_fp16 and self.params.fp16_enable_auto_loss_scale:
+      if self.params.all_reduce_spec and 'nccl' in self.params.all_reduce_spec:
+        raise ValueError('Automatic loss scaling is not supported with NCCL.')
+      if self.params.variable_update not in ('parameter_server', 'replicated'):
+        raise ValueError('Automatic loss scaling is not supported with '
+                         'variable_update=%s.' % self.params.variable_update)
+      if self.params.staged_vars:
+        raise ValueError('Automatic loss scaling is not supported with'
+                         'staged_vars.')
 
     # Use the batch size from the command line if specified, otherwise use the
     # model's default batch size.  Scale the benchmark's batch size by the
@@ -722,10 +757,30 @@ class BenchmarkCNN(object):
     use_controller = (
         self.params.variable_update == 'distributed_all_reduce' and
         self.job_name)
+    if use_controller and not params.controller_host:
+      raise ValueError('When variable_update==distributed_all_reduce '
+                       'controller_host must also be specified.')
 
     self.local_parameter_device_flag = self.params.local_parameter_device
-    if 0 :
-      aa_debug = 1
+    if self.job_name:
+      self.task_index = self.params.task_index
+      self.cluster_manager = platforms_util.get_cluster_manager(
+          params, create_config_proto(params))
+      assert isinstance(self.cluster_manager, cnn_util.BaseClusterManager)
+
+      worker_prefix = '/job:worker/task:%s' % self.task_index
+      if use_ps_server:
+        self.param_server_device = tf.train.replica_device_setter(
+            worker_device=worker_prefix + '/cpu:0',
+            cluster=self.cluster_manager.get_cluster_spec())
+        # This device on which the queues for managing synchronization between
+        # servers should be stored.
+        self.sync_queue_devices = [
+            '/job:ps/task:%s/cpu:0' % i
+            for i in range(self.cluster_manager.num_ps())
+        ]
+      else:
+        self.sync_queue_devices = ['/job:worker/task:0/cpu:0']
     else:
       self.task_index = 0
       self.cluster_manager = None
@@ -737,6 +792,9 @@ class BenchmarkCNN(object):
         self.cluster_manager.num_workers() if self.cluster_manager else 1)
     self.num_ps = self.cluster_manager.num_ps() if self.cluster_manager else 0
 
+    if self.num_workers > 1 and self.params.all_reduce_spec == 'nccl':
+      raise ValueError('--all_reduce_spec=nccl is invalid in a '
+                       'multi-worker job')
 
     # Device to use for ops that need to always run on the local worker's CPU.
     self.cpu_device = '%s/cpu:0' % worker_prefix
@@ -748,16 +806,91 @@ class BenchmarkCNN(object):
         for i in xrange(self.num_gpus)
     ]
 
-    self.variable_mgr = variable_mgr.VariableMgrLocalFetchFromPS(self)
+    if (self.params.staged_vars and
+        self.params.variable_update != 'parameter_server'):
+      raise ValueError('staged_vars for now is only supported with '
+                       'variable_update=parameter_server')
+
+    if self.params.variable_update == 'parameter_server':
+      if self.job_name:
+        if not self.params.staged_vars:
+          self.variable_mgr = variable_mgr.VariableMgrDistributedFetchFromPS(
+              self)
+        else:
+          self.variable_mgr = (
+              variable_mgr.VariableMgrDistributedFetchFromStagedPS(self))
+      else:
+        if not self.params.staged_vars:
+          self.variable_mgr = variable_mgr.VariableMgrLocalFetchFromPS(self)
+        else:
+          self.variable_mgr = variable_mgr.VariableMgrLocalFetchFromStagedPS(
+              self)
+    elif self.params.variable_update == 'replicated':
+      if self.job_name:
+        raise ValueError('Invalid variable_update in distributed mode: %s' %
+                         self.params.variable_update)
+      self.variable_mgr = variable_mgr.VariableMgrLocalReplicated(
+          self, self.params.all_reduce_spec,
+          self.params.agg_small_grads_max_bytes,
+          self.params.agg_small_grads_max_group)
+    elif self.params.variable_update == 'distributed_all_reduce':
+      assert self.params.cross_replica_sync
+      self.variable_mgr = variable_mgr.VariableMgrDistributedAllReduce(
+          self, self.params.all_reduce_spec,
+          ('worker' if self.num_workers > 1 else 'localhost'), self.num_workers,
+          self.params.agg_small_grads_max_bytes,
+          self.params.agg_small_grads_max_group)
+    elif self.params.variable_update == 'distributed_replicated':
+      assert self.params.cross_replica_sync
+      if not self.job_name:
+        raise ValueError('Invalid variable_update in local mode: %s' %
+                         self.params.variable_update)
+      self.variable_mgr = variable_mgr.VariableMgrDistributedReplicated(self)
+    elif self.params.variable_update == 'independent':
+      if self.job_name:
+        raise ValueError('Invalid variable_update in distributed mode: %s' %
+                         self.params.variable_update)
+      self.variable_mgr = variable_mgr.VariableMgrIndependent(self)
+    else:
+      raise ValueError(
+          'Invalid variable_update: %s' % self.params.variable_update)
 
     # Device to use for running on the local worker's compute device, but
     # with variables assigned to parameter server devices.
     self.devices = self.variable_mgr.get_devices()
-    self.global_step_device = self.cpu_device
+    if self.job_name:
+      if use_ps_server:
+        self.global_step_device = self.param_server_device
+      else:
+        self.global_step_device = '/job:worker/task:0/cpu:0'
+    else:
+      self.global_step_device = self.cpu_device
 
     self.image_preprocessor = self.get_image_preprocessor()
     self.init_global_step = 0
 
+  def reset_devices_for_task(self, task_num, is_local=False):
+    """Used to imitate another task when building a distributed graph."""
+    worker_prefix = ('job:localhost'
+                     if is_local else '/job:worker/task:%s' % task_num)
+    self.cpu_device = '%s/cpu:0' % worker_prefix
+    self.raw_devices = [
+        '%s/%s:%i' % (worker_prefix, self.params.device, i)
+        for i in xrange(self.num_gpus)
+    ]
+    self.devices = self.variable_mgr.get_devices()
+
+  def raw_devices_across_tasks(self, is_local=False):
+    """Returns list of raw device names across all tasks."""
+    if is_local:
+      assert self.num_workers == 1
+      return self.raw_devices
+    else:
+      return [
+          'job:worker/task%s/%s:%i' % (t, self.params.device, i)
+          for t in xrange(self.num_workers)
+          for i in xrange(self.num_gpus)
+      ]
 
   def print_info(self):
     """Print basic information."""
@@ -769,7 +902,10 @@ class BenchmarkCNN(object):
     log_fn('Mode:        %s' % get_mode_from_params(self.params))
     single_session = self.params.variable_update == 'distributed_all_reduce'
     log_fn('SingleSess:  %s' % single_session)
-    device_list = self.raw_devices
+    if single_session:
+      device_list = self.raw_devices_across_tasks()
+    else:
+      device_list = self.raw_devices
     batch_size = self.num_workers * self.batch_size
     log_fn('Batch size:  %s global' % batch_size)
     log_fn('             %s per device' % (batch_size / len(device_list)))
@@ -781,14 +917,121 @@ class BenchmarkCNN(object):
     log_fn('Layout optimizer: %s' % self.enable_layout_optimizer)
     log_fn('Optimizer:   %s' % self.params.optimizer)
     log_fn('Variables:   %s' % self.params.variable_update)
-
+    if (self.params.variable_update == 'replicated' or
+        self.params.variable_update == 'distributed_all_reduce'):
+      log_fn('AllReduce:   %s' % self.params.all_reduce_spec)
+    if self.job_name:
+      log_fn('Sync:        %s' % self.params.cross_replica_sync)
+    if self.params.staged_vars:
+      log_fn('Staged vars: %s' % self.params.staged_vars)
+    log_fn('==========')
 
   def run(self):
+    """Run the benchmark task assigned to this process.
+
+    Returns:
+      Dictionary of statistics for training or eval.
+    Raises:
+       ValueError: unrecognized job name.
+    """
+    if self.params.job_name == 'ps':
+      log_fn('Running parameter server %s' % self.task_index)
+      self.cluster_manager.join_server()
+      return {}
+
+    # For distributed_all_reduce with multiple workers, drive
+    # from a separate controller process.
+    if self.params.variable_update == 'distributed_all_reduce':
+      if self.params.job_name == 'worker':
+        log_fn('Starting worker %s' % self.task_index)
+        self.cluster_manager.join_server()
+        return
+      elif self.params.job_name and self.params.job_name != 'controller':
+        raise ValueError('unrecognized job name: %s' % self.params.job_name)
 
     with tf.Graph().as_default():
-      return self._benchmark_cnn()
+      if self.params.eval:
+        return self._eval_cnn()
+      else:
+        return self._benchmark_cnn()
 
+  def _eval_cnn(self):
+    """Evaluate a model every self.params.eval_interval_secs.
 
+    Returns:
+      Dictionary containing eval statistics. Currently returns an empty
+      dictionary.
+    """
+    (image_producer_ops, enqueue_ops, fetches) = self._build_model()
+    saver = tf.train.Saver(self.variable_mgr.savable_variables())
+    summary_writer = tf.summary.FileWriter(self.params.eval_dir,
+                                           tf.get_default_graph())
+    target = ''
+    local_var_init_op = tf.local_variables_initializer()
+    variable_mgr_init_ops = [local_var_init_op]
+    with tf.control_dependencies([local_var_init_op]):
+      variable_mgr_init_ops.extend(self.variable_mgr.get_post_init_ops())
+    local_var_init_op_group = tf.group(*variable_mgr_init_ops)
+    summary_op = tf.summary.merge_all()
+    # TODO(huangyp): Check if checkpoints haven't updated for hours and abort.
+    while True:
+      self._eval_once(saver, summary_writer, target, local_var_init_op_group,
+                      image_producer_ops, enqueue_ops, fetches, summary_op)
+      if self.params.eval_interval_secs <= 0:
+        break
+      time.sleep(self.params.eval_interval_secs)
+    return {}
+
+  def _eval_once(self, saver, summary_writer, target, local_var_init_op_group,
+                 image_producer_ops, enqueue_ops, fetches, summary_op):
+    """Evaluate the model from a checkpoint using validation dataset."""
+    with tf.Session(
+        target=target, config=create_config_proto(self.params)) as sess:
+      if self.params.train_dir is None:
+        raise ValueError('Trained model directory not specified')
+      try:
+        global_step = load_checkpoint(saver, sess, self.params.train_dir)
+      except CheckpointNotFoundException:
+        log_fn('Checkpoint not found in %s' % self.params.train_dir)
+        return
+      sess.run(local_var_init_op_group)
+      if self.dataset.queue_runner_required():
+        tf.train.start_queue_runners(sess=sess)
+      image_producer = cnn_util.ImageProducer(sess, image_producer_ops,
+                                              self.batch_group_size)
+      image_producer.start()
+      for i in xrange(len(enqueue_ops)):
+        sess.run(enqueue_ops[:(i + 1)])
+        image_producer.notify_image_consumption()
+      start_time = time.time()
+      top_1_accuracy_sum = 0.0
+      top_5_accuracy_sum = 0.0
+      total_eval_count = self.num_batches * self.batch_size
+      for step in xrange(self.num_batches):
+        if (self.params.save_summaries_steps > 0 and
+            (step + 1) % self.params.save_summaries_steps == 0):
+          results, summary_str = sess.run([fetches, summary_op])
+          summary_writer.add_summary(summary_str)
+        else:
+          results = sess.run(fetches)
+        top_1_accuracy_sum += results['top_1_accuracy']
+        top_5_accuracy_sum += results['top_5_accuracy']
+        if (step + 1) % self.params.display_every == 0:
+          duration = time.time() - start_time
+          examples_per_sec = (
+              self.batch_size * self.params.display_every / duration)
+          log_fn('%i\t%.1f examples/sec' % (step + 1, examples_per_sec))
+          start_time = time.time()
+        image_producer.notify_image_consumption()
+      image_producer.done()
+      precision_at_1 = top_1_accuracy_sum / self.num_batches
+      recall_at_5 = top_5_accuracy_sum / self.num_batches
+      summary = tf.Summary()
+      summary.value.add(tag='eval/Accuracy@1', simple_value=precision_at_1)
+      summary.value.add(tag='eval/Recall@5', simple_value=recall_at_5)
+      summary_writer.add_summary(summary, global_step)
+      log_fn('Precision @ 1 = %.4f recall @ 5 = %.4f [%d examples]' %
+             (precision_at_1, recall_at_5, total_eval_count))
 
   def _benchmark_cnn(self):
     """Run cnn in benchmark mode. When forward_only on, it forwards CNN.
@@ -797,18 +1040,31 @@ class BenchmarkCNN(object):
       Dictionary containing training statistics (num_workers, num_steps,
       average_wall_time, images_per_sec).
     """
-    self.single_session = False
-    (image_producer_ops, enqueue_ops, fetches) = self._build_model()
+    if self.params.variable_update == 'distributed_all_reduce':
+      self.single_session = True
+      (image_producer_ops, enqueue_ops, fetches) = (
+          self._build_model_single_session())
+    else:
+      self.single_session = False
+      (image_producer_ops, enqueue_ops, fetches) = self._build_model()
     fetches_list = nest.flatten(list(fetches.values()))
     main_fetch_group = tf.group(*fetches_list)
     execution_barrier = None
-    
+    if (not self.single_session and self.job_name and
+        not self.params.cross_replica_sync):
+      execution_barrier = self.add_sync_queues_and_barrier(
+          'execution_barrier_', [])
 
     global_step = tf.train.get_global_step()
     with tf.device(self.global_step_device):
       with tf.control_dependencies([main_fetch_group]):
         fetches['inc_global_step'] = global_step.assign_add(1)
 
+    if ((not self.single_session) and self.job_name and
+        self.params.cross_replica_sync):
+      # Block all replicas until all replicas are ready for next step.
+      fetches['sync_queues'] = self.add_sync_queues_and_barrier(
+          'sync_queues_step_end_', [main_fetch_group])
 
     local_var_init_op = tf.local_variables_initializer()
     variable_mgr_init_ops = [local_var_init_op]
@@ -819,7 +1075,23 @@ class BenchmarkCNN(object):
     summary_op = tf.summary.merge_all()
     is_chief = (not self.job_name or self.task_index == 0)
     summary_writer = None
-    
+    if (is_chief and self.params.summary_verbosity and self.params.train_dir and
+        self.params.save_summaries_steps > 0):
+      summary_writer = tf.summary.FileWriter(self.params.train_dir,
+                                             tf.get_default_graph())
+
+    # We want to start the benchmark timer right after a image_producer barrier
+    # and avoids undesired wating times on barriers.
+    if ((self.num_warmup_batches + len(enqueue_ops) - 1) %
+        self.batch_group_size) != 0:
+      self.num_warmup_batches = int(
+          math.ceil((self.num_warmup_batches + len(enqueue_ops) - 1.0) /
+                    (self.batch_group_size
+                    )) * self.batch_group_size - len(enqueue_ops) + 1)
+      log_fn('Round up warm up steps to %d to match batch_group_size' %
+             self.num_warmup_batches)
+      assert ((self.num_warmup_batches + len(enqueue_ops) - 1) %
+              self.batch_group_size) == 0
     # We run the summaries in the same thread as the training operations by
     # passing in None for summary_op to avoid a summary_thread being started.
     # Running summaries and training operations in parallel could run out of
@@ -827,7 +1099,15 @@ class BenchmarkCNN(object):
     saver = tf.train.Saver(
         self.variable_mgr.savable_variables(), save_relative_paths=True)
     ready_for_local_init_op = None
-    
+    if self.job_name and not self.single_session:
+      # In distributed mode, we don't want to run local_var_init_op_group until
+      # the global variables are initialized, because local_var_init_op_group
+      # may use global variables (such as in distributed replicated mode). We
+      # don't set this in non-distributed mode, because in non-distributed mode,
+      # local_var_init_op_group may itself initialize global variables (such as
+      # in replicated mode).
+      ready_for_local_init_op = tf.report_uninitialized_variables(
+          tf.global_variables())
     sv = tf.train.Supervisor(
         is_chief=is_chief,
         logdir=self.params.train_dir,
@@ -862,11 +1142,26 @@ class BenchmarkCNN(object):
             self.init_global_step,
             self.num_workers * (self.num_warmup_batches + self.num_batches) - 1)
         global_step_watcher.start()
-      
+      else:
+        global_step_watcher = None
+
+      if self.graph_file is not None:
+        path, filename = os.path.split(self.graph_file)
+        as_text = filename.endswith('txt')
+        log_fn('Writing GraphDef as %s to %s' % (  # pyformat break
+            'text' if as_text else 'binary', self.graph_file))
+        tf.train.write_graph(sess.graph_def, path, filename, as_text)
 
       log_fn('Running warm up')
       local_step = -1 * self.num_warmup_batches
-      done_fn = global_step_watcher.done
+
+      if self.single_session or (self.params.cross_replica_sync and
+                                 self.params.job_name):
+        # In cross-replica sync mode, all workers must run the same number of
+        # local steps, or else the workers running the extra step will block.
+        done_fn = lambda: local_step == self.num_batches
+      else:
+        done_fn = global_step_watcher.done
       loop_start_time = time.time()
       while not done_fn():
         if local_step == 0:
@@ -1171,8 +1466,20 @@ class BenchmarkCNN(object):
     fetches['total_loss'] = total_loss
     return fetches
 
-   
-     
+  def _build_model_single_session(self):
+    """Build the TensorFlow graph for multiple replicas in a single_session.
+
+    Returns:
+      image_producer_ops:
+      enqueue_ops:
+      fetches:
+
+    Raises:
+       ValueError: optimizer not recognized.
+
+    Single session runs multiple model replicas as part of one large
+    distributed graph, whose global execution is always step-synchronized.
+    """
     # verify assumptions
     assert self.params.task_index == 0
     assert not self.params.eval

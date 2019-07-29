@@ -41,7 +41,8 @@ def main(_):
         server.join()
         sys.exit('0')
     elif FLAGS.job_name=='worker':
-        config.gpu_options.per_process_gpu_memory_fraction = 0.2
+        #config.gpu_options.per_process_gpu_memory_fraction = 0.2
+        config.device_count['GPU']=FLAGS.task_index
         server = tf.train.Server(clusterSpec,
                                  job_name=FLAGS.job_name,
                                  task_index=FLAGS.task_index,
@@ -49,7 +50,7 @@ def main(_):
                                  )
         is_chief = (FLAGS.task_index==0)
 
-        worker_device='/job:worker/task:{}'.format(FLAGS.task_index)
+        worker_device='/job:worker/task:{}/gpu:{}'.format(FLAGS.task_index, FLAGS.task_index)
         device_func = tf.train.replica_device_setter(worker_device=worker_device,
                                                      cluster=clusterSpec
                                                      )
@@ -66,7 +67,7 @@ def main(_):
             n_inputs = 784  # total pixels
 
             learning_rate = 0.01
-            n_epochs = 50
+            n_epochs = 500
             batch_size = 100
             n_batches = int(mnist.train.num_examples/batch_size)
             n_epochs_print=10

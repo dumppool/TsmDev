@@ -1131,21 +1131,10 @@ class BenchmarkCNN(object):
     nclass = self.dataset.num_classes + 1
     input_data_type = get_data_type(self.params)
     data_type = get_data_type(self.params)
-    if not self.use_synthetic_gpu_images:
-      with tf.device(self.cpu_device):
-        host_images, host_labels = image_producer_stage.get()
-        images_shape = host_images.get_shape()
-        labels_shape = host_labels.get_shape()
+    
     with tf.device(self.raw_devices[rel_device_num]):
-      if not self.use_synthetic_gpu_images:
-        gpu_compute_stage = data_flow_ops.StagingArea(
-            [host_images.dtype, host_labels.dtype],
-            shapes=[images_shape, labels_shape])
-        # The CPU-to-GPU copy is triggered here.
-        gpu_compute_stage_op = gpu_compute_stage.put([host_images, host_labels])
-        images, labels = gpu_compute_stage.get()
-        images = tf.reshape(images, shape=images_shape)
-        gpu_compute_stage_ops.append(gpu_compute_stage_op)
+      if 0:
+        aa_debug = 1
       else:
         # Minor hack to avoid H2D copy when using synthetic data
         image_size = self.model.get_image_size()
@@ -1178,11 +1167,7 @@ class BenchmarkCNN(object):
 
       if self.data_format == 'NCHW':
         images = tf.transpose(images, [0, 3, 1, 2])
-      if input_data_type != data_type:
-        images = tf.cast(images, data_type)
       var_type = tf.float32
-      if data_type == tf.float16 and self.params.fp16_vars:
-        var_type = tf.float16
       network = convnet_builder.ConvNetBuilder(
           images, self.dataset.depth, phase_train, self.params.use_tf_layers,
           self.data_format, data_type, var_type)
@@ -1191,40 +1176,13 @@ class BenchmarkCNN(object):
         # Add the final fully-connected class layer
         logits = network.affine(nclass, activation='linear')
         aux_logits = None
-        if network.aux_top_layer is not None:
-          with network.switch_to_aux_top_layer():
-            aux_logits = network.affine(
-                nclass, activation='linear', stddev=0.001)
-      if data_type == tf.float16:
-        # TODO(reedwm): Determine if we should do this cast here.
-        logits = tf.cast(logits, tf.float32)
-        if aux_logits is not None:
-          aux_logits = tf.cast(aux_logits, tf.float32)
 
       results = {}  # The return value
-      if not phase_train or self.params.print_training_accuracy:
-        top_1_op = tf.reduce_sum(
-            tf.cast(tf.nn.in_top_k(logits, labels, 1), data_type))
-        top_5_op = tf.reduce_sum(
-            tf.cast(tf.nn.in_top_k(logits, labels, 5), data_type))
-        results['top_1_op'] = top_1_op
-        results['top_5_op'] = top_5_op
-
-      if not phase_train:
-        results['logits'] = logits
-        return results
+      
       loss = loss_function(logits, labels, aux_logits=aux_logits)
       params = self.variable_mgr.trainable_variables_on_device(
           rel_device_num, abs_device_num)
-      if data_type == tf.float16 and self.params.fp16_vars:
-        # fp16 reductions are very slow on GPUs, so cast to fp32 before calling
-        # tf.nn.l2_loss and tf.add_n.
-        # TODO(b/36217816): Once the bug is fixed, investigate if we should do
-        # this reduction in fp16.
-        fp32_params = (tf.cast(p, tf.float32) for p in params)
-        l2_loss = tf.add_n([tf.nn.l2_loss(v) for v in fp32_params])
-      else:
-        l2_loss = tf.add_n([tf.nn.l2_loss(v) for v in params])
+      l2_loss = tf.add_n([tf.nn.l2_loss(v) for v in params])
       weight_decay = self.params.weight_decay
       if weight_decay is not None and weight_decay != 0.:
         loss += weight_decay * l2_loss
@@ -1232,30 +1190,7 @@ class BenchmarkCNN(object):
       aggmeth = tf.AggregationMethod.DEFAULT
       scaled_loss = loss if self.loss_scale is None else loss * self.loss_scale
       grads = tf.gradients(scaled_loss, params, aggregation_method=aggmeth)
-      if self.loss_scale is not None:
-        # TODO(reedwm): If automatic loss scaling is not used, we could avoid
-        # these multiplications by directly modifying the learning rate instead.
-        # If this is done, care must be taken to ensure that this scaling method
-        # is correct, as some optimizers square gradients and do other
-        # operations which might not be compatible with modifying both the
-        # gradients and the learning rate.
-
-        grads = [
-            grad * tf.cast(1. / self.loss_scale, grad.dtype) for grad in grads
-        ]
-
-      if self.params.staged_vars:
-        grad_dtypes = [grad.dtype for grad in grads]
-        grad_shapes = [grad.shape for grad in grads]
-        grad_stage = data_flow_ops.StagingArea(grad_dtypes, grad_shapes)
-        grad_stage_op = grad_stage.put(grads)
-        # In general, this decouples the computation of the gradients and
-        # the updates of the weights.
-        # During the pipeline warm up, this runs enough training to produce
-        # the first set of gradients.
-        gpu_grad_stage_ops.append(grad_stage_op)
-        grads = grad_stage.get()
-
+      
       param_refs = self.variable_mgr.trainable_variables_on_device(
           rel_device_num, abs_device_num, writable=True)
       gradvars = list(zip(grads, param_refs))
@@ -1273,10 +1208,6 @@ class BenchmarkCNN(object):
     input_data_type = get_data_type(self.params)
 
     shift_ratio = 0
-    if self.job_name:
-      # shift_ratio prevents multiple workers from processing the same batch
-      # during a step
-      shift_ratio = float(self.task_index) / self.num_workers
 
     processor_class = self.dataset.get_image_preprocessor()
     assert processor_class
@@ -1294,49 +1225,10 @@ class BenchmarkCNN(object):
         distort_color_in_yiq=self.params.distort_color_in_yiq,
         fuse_decode_and_crop=self.params.fuse_decode_and_crop)
 
-  def add_sync_queues_and_barrier(self, name_prefix, enqueue_after_list):
-    """Adds ops to enqueue on all worker queues.
-
-    Args:
-      name_prefix: prefixed for the shared_name of ops.
-      enqueue_after_list: control dependency from ops.
-
-    Returns:
-      an op that should be used as control dependency before starting next step.
-    """
-    self.sync_queue_counter += 1
-    with tf.device(self.sync_queue_devices[(
-        self.sync_queue_counter % len(self.sync_queue_devices))]):
-      sync_queues = [
-          tf.FIFOQueue(self.num_workers, [tf.bool], shapes=[[]],
-                       shared_name='%s%s' % (name_prefix, i))
-          for i in range(self.num_workers)]
-      queue_ops = []
-      # For each other worker, add an entry in a queue, signaling that it can
-      # finish this step.
-      token = tf.constant(False)
-      with tf.control_dependencies(enqueue_after_list):
-        for i, q in enumerate(sync_queues):
-          if i == self.task_index:
-            queue_ops.append(tf.no_op())
-          else:
-            queue_ops.append(q.enqueue(token))
-
-      # Drain tokens off queue for this worker, one for each other worker.
-      queue_ops.append(
-          sync_queues[self.task_index].dequeue_many(len(sync_queues) - 1))
-
-      return tf.group(*queue_ops)
-
-
-def store_benchmarks(names_to_values, params):
-  if params.result_storage:
-    benchmark_storage.store_benchmark(names_to_values, params.result_storage)
 
 
 def setup(params):
   """Sets up the environment that BenchmarkCNN should run in.
-
   Args:
     params: Params tuple, typically created by make_params or
             make_params_from_flags.
@@ -1345,43 +1237,22 @@ def setup(params):
   Raises:
     ValueError: invalid parames combinations.
   """
-  if params.winograd_nonfused:
-    os.environ['TF_ENABLE_WINOGRAD_NONFUSED'] = '1'
-  else:
-    os.environ.pop('TF_ENABLE_WINOGRAD_NONFUSED', None)
-  if params.autotune_threshold:
-    os.environ['TF_AUTOTUNE_THRESHOLD'] = str(params.autotune_threshold)
+  os.environ['TF_ENABLE_WINOGRAD_NONFUSED'] = '1'
   os.environ['TF_SYNC_ON_FINISH'] = str(int(params.sync_on_finish))
   argparse.ArgumentParser(
       formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 
-  # Sets environment variables for MKL
-  if params.mkl:
-    os.environ['KMP_BLOCKTIME'] = str(params.kmp_blocktime)
-    os.environ['KMP_SETTINGS'] = str(params.kmp_settings)
-    os.environ['KMP_AFFINITY'] = params.kmp_affinity
-    if params.num_intra_threads > 0:
-      os.environ['OMP_NUM_THREADS'] = str(params.num_intra_threads)
 
   # Sets GPU thread settings
   params = params._replace(gpu_thread_mode=params.gpu_thread_mode.lower())
-  if params.gpu_thread_mode not in ['global', 'gpu_shared', 'gpu_private']:
-    raise ValueError('Invalid gpu_thread_mode: %s' % params.gpu_thread_mode)
   os.environ['TF_GPU_THREAD_MODE'] = params.gpu_thread_mode
 
-  if params.per_gpu_thread_count and params.gpu_thread_mode == 'global':
-    raise ValueError(
-        'Invalid per_gpu_thread_count with gpu_thread_mode=global: %s' %
-        params.per_gpu_thread_count)
   # Default to two threads. One for the device compute and the other for
   # memory copies.
   per_gpu_thread_count = params.per_gpu_thread_count or 2
   total_gpu_thread_count = per_gpu_thread_count * params.num_gpus
 
-  if params.gpu_thread_mode == 'gpu_private':
-    os.environ['TF_GPU_THREAD_COUNT'] = str(per_gpu_thread_count)
-  elif params.gpu_thread_mode == 'gpu_shared':
-    os.environ['TF_GPU_THREAD_COUNT'] = str(total_gpu_thread_count)
+  os.environ['TF_GPU_THREAD_COUNT'] = str(per_gpu_thread_count)
 
   if not params.num_inter_threads and params.gpu_thread_mode in [
       'gpu_private', 'gpu_shared'

@@ -65,30 +65,10 @@ _model_name_to_cifar_model = {
 #    'densenet100_k24': densenet_model.create_densenet100_k24_model,
 }
 
-
-def _get_model_map(dataset_name):
-  if 'cifar10' == dataset_name:
-    return _model_name_to_cifar_model
-  elif dataset_name in ('imagenet', 'synthetic'):
-    return _model_name_to_imagenet_model
-  else:
-    raise ValueError('Invalid dataset name: %s' % dataset_name)
-
-
-def get_model_config(model_name, dataset):
-  """Map model name to model network configuration."""
-  model_map = _get_model_map(dataset.name)
-  if model_name not in model_map:
-    raise ValueError('Invalid model name \'%s\' for dataset \'%s\'' %
-                     (model_name, dataset.name))
-  else:
-    return model_map[model_name]()
-
-
-def register_model(model_name, dataset_name, model_func):
-  """Register a new model that can be obtained with `get_model_config`."""
-  model_map = _get_model_map(dataset_name)
-  if model_name in model_map:
-    raise ValueError('Model "%s" is already registered for dataset "%s"' %
-                     (model_name, dataset_name))
-  model_map[model_name] = model_func
+def _get_model_map(dataset_name): 
+    return _model_name_to_imagenet_model 
+    
+def get_model_config(model_name, dataset): 
+  """Map model name to model network configuration.""" 
+  model_map = _get_model_map(dataset.name) 
+  return model_map[model_name]() 

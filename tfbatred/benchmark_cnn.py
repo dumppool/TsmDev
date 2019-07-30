@@ -1,17 +1,3 @@
-# Copyright 2017 The TensorFlow Authors. All Rights Reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-# ==============================================================================
 """TensorFlow benchmark library.
 
 See the README for more information.
@@ -39,20 +25,26 @@ from tensorflow.python.client import timeline
 from tensorflow.python.ops import data_flow_ops
 from tensorflow.python.platform import gfile
 from tensorflow.python.util import nest
-import benchmark_storage
+#import benchmark_storage
 import cnn_util
 import convnet_builder
 import datasets
 import variable_mgr
 import variable_mgr_util
-from cnn_util import log_fn
-from cnn_util import ParamSpec
+#from cnn_util import log_fn
+#from cnn_util import ParamSpec
 from models import model_config
 from platforms import util as platforms_util
 
 # _DEFAULT_PARAMS maps from each parameter's name to its ParamSpec. For each
 # parameter listed here, a command line flag will be defined for
 # tf_cnn_benchmarks.py.
+
+def log_fn(log):
+  print(log)
+
+ParamSpec = namedtuple('_ParamSpec',['flag_type', 'default_value', 'description']) 
+
 _DEFAULT_PARAMS = {
     'model':
         ParamSpec('string', 'trivial', 'name of the model to run'),
@@ -412,13 +404,8 @@ def define_flags():
       'string': flags.DEFINE_string,
   }
   for name, param_spec in six.iteritems(_DEFAULT_PARAMS):
-    if param_spec.flag_type not in define_flag:
-      raise ValueError('Unknown flag_type %s' % param_spec.flag_type)
-    else:
-      define_flag[param_spec.flag_type](name, param_spec.default_value,
-                                        param_spec.description)
+      define_flag[param_spec.flag_type](name, param_spec.default_value,                                       param_spec.description)
       flags.declare_key_flag(name)
-
 
 FLAGS = flags.FLAGS
 
@@ -491,12 +478,6 @@ def loss_function(logits, labels, aux_logits):
     cross_entropy = tf.losses.sparse_softmax_cross_entropy(
         logits=logits, labels=labels)
     loss = tf.reduce_mean(cross_entropy, name='xentropy_mean')
-  if aux_logits is not None:
-    with tf.name_scope('aux_xentropy'):
-      aux_cross_entropy = tf.losses.sparse_softmax_cross_entropy(
-          logits=aux_logits, labels=labels)
-      aux_loss = 0.4 * tf.reduce_mean(aux_cross_entropy, name='aux_loss')
-      loss = tf.add_n([loss, aux_loss])
   return loss
 
 
@@ -512,35 +493,11 @@ def create_config_proto(params):
   config.intra_op_parallelism_threads = params.num_intra_threads
   config.inter_op_parallelism_threads = params.num_inter_threads
   config.gpu_options.force_gpu_compatible = params.force_gpu_compatible
-  if params.gpu_memory_frac_for_testing > 0:
-    config.gpu_options.per_process_gpu_memory_fraction = (
-        params.gpu_memory_frac_for_testing)
-  if params.xla:
-    config.graph_options.optimizer_options.global_jit_level = (
-        tf.OptimizerOptions.ON_1)
-  if params.enable_layout_optimizer:
-    config.graph_options.rewrite_options.layout_optimizer = (
-        rewriter_config_pb2.RewriterConfig.ON)
 
   return config
 
 
 def get_mode_from_params(params):
-  """Returns the mode in which this script is running.
-
-  Args:
-    params: Params tuple, typically created by make_params or
-            make_params_from_flags.
-  Raises:
-    ValueError: Unsupported params settings.
-  """
-  if params.forward_only and params.eval:
-    raise ValueError('Only one of forward_only and eval parameters is true')
-
-  if params.eval:
-    return 'evaluation'
-  if params.forward_only:
-    return 'forward-only'
   return 'training'
 
 
@@ -554,39 +511,23 @@ def benchmark_one_step(sess,
                        params,
                        summary_op=None):
   """Advance one step of benchmarking."""
-  if trace_filename and step == -1:
-    run_options = tf.RunOptions(trace_level=tf.RunOptions.FULL_TRACE)
-    run_metadata = tf.RunMetadata()
-  else:
-    run_options = None
-    run_metadata = None
+   
+  run_options = None
+  run_metadata = None
   summary_str = None
   start_time = time.time()
-  if summary_op is None:
-    results = sess.run(fetches, options=run_options, run_metadata=run_metadata)
-  else:
-    (results, summary_str) = sess.run(
-        [fetches, summary_op], options=run_options, run_metadata=run_metadata)
-
-  if not params.forward_only:
-    lossval = results['total_loss']
-  else:
-    lossval = 0.
+   
+  results = sess.run(fetches, options=run_options, run_metadata=run_metadata)
+  lossval = results['total_loss']
+  
   image_producer.notify_image_consumption()
   train_time = time.time() - start_time
   step_train_times.append(train_time)
   if step >= 0 and (step == 0 or (step + 1) % params.display_every == 0):
     log_str = '%i\t%s\t%.3f' % (
         step + 1, get_perf_timing_str(batch_size, step_train_times), lossval)
-    if 'top_1_accuracy' in results:
-      log_str += '\t%.3f\t%.3f' % (results['top_1_accuracy'],
-                                   results['top_5_accuracy'])
     log_fn(log_str)
-  if trace_filename and step == -1:
-    log_fn('Dumping trace to %s' % trace_filename)
-    trace = timeline.Timeline(step_stats=run_metadata.step_stats)
-    with gfile.Open(trace_filename, 'w') as trace_file:
-      trace_file.write(trace.generate_chrome_trace_format(show_memory=True))
+   
   return summary_str
 
 
@@ -600,33 +541,6 @@ def get_perf_timing_str(batch_size, step_train_times, scale=1):
     speed_jitter = speed_madstd
     return ('images/sec: %.1f +/- %.1f (jitter = %.1f)' %
             (speed_mean, speed_uncertainty, speed_jitter))
-  else:
-    return 'images/sec: %.1f' % speed_mean
-
-
-def load_checkpoint(saver, sess, ckpt_dir):
-  ckpt = tf.train.get_checkpoint_state(ckpt_dir)
-  if ckpt and ckpt.model_checkpoint_path:
-    if os.path.isabs(ckpt.model_checkpoint_path):
-      # Restores from checkpoint with absolute path.
-      model_checkpoint_path = ckpt.model_checkpoint_path
-    else:
-      # Restores from checkpoint with relative path.
-      model_checkpoint_path = os.path.join(ckpt_dir, ckpt.model_checkpoint_path)
-    # Assuming model_checkpoint_path looks something like:
-    #   /my-favorite-path/imagenet_train/model.ckpt-0,
-    # extract global_step from it.
-    global_step = ckpt.model_checkpoint_path.split('/')[-1].split('-')[-1]
-    if not global_step.isdigit():
-      global_step = 0
-    else:
-      global_step = int(global_step)
-    saver.restore(sess, model_checkpoint_path)
-    log_fn('Successfully loaded model from %s.' % ckpt.model_checkpoint_path)
-    return global_step
-  else:
-    raise CheckpointNotFoundException('No checkpoint file found.')
-
 
 # Params are passed to BenchmarkCNN's constructor. Params is a map from name
 # to value, with one field per key in _DEFAULT_PARAMS.
@@ -636,23 +550,6 @@ def load_checkpoint(saver, sess, ckpt_dir):
 # Params directly.
 Params = namedtuple('Params', _DEFAULT_PARAMS.keys())  # pylint: disable=invalid-name
 
-
-def make_params(**kwargs):
-  """Create a Params tuple for BenchmarkCNN from kwargs.
-
-  Default values are filled in from _DEFAULT_PARAMS.
-
-  Args:
-    **kwargs: kwarg values will override the default values.
-  Returns:
-    Params namedtuple for constructing BenchmarkCNN.
-  """
-  # Create a (name: default_value) map from PARAMS.
-  default_kwargs = {
-      name: _DEFAULT_PARAMS[name].default_value
-      for name in _DEFAULT_PARAMS
-  }
-  return Params(**default_kwargs)._replace(**kwargs)
 
 
 def make_params_from_flags():
@@ -773,9 +670,7 @@ class BenchmarkCNN(object):
     batch_size = self.num_workers * self.batch_size
     log_fn('Batch size:  %s global' % batch_size)
     log_fn('             %s per device' % (batch_size / len(device_list)))
-    if self.batch_group_size > 1:
-      log_fn('             %d batches per prepocessing group' %
-             self.batch_group_size)
+    
     log_fn('Devices:     %s' % device_list)
     log_fn('Data format: %s' % self.data_format)
     log_fn('Layout optimizer: %s' % self.enable_layout_optimizer)
@@ -917,10 +812,7 @@ class BenchmarkCNN(object):
   def _build_image_processing(self, shift_ratio=0):
     """"Build the image (pre)processing portion of the model graph."""
     with tf.device(self.cpu_device):
-      if self.params.eval:
-        subset = 'validation'
-      else:
-        subset = 'train'
+      subset = 'train'
       image_producer_ops = []
       image_producer_stages = []
       images_splits, labels_splits = self.image_preprocessor.minibatch(
@@ -1038,91 +930,7 @@ class BenchmarkCNN(object):
     fetches['total_loss'] = total_loss
     return fetches
 
-   
-     
-    # verify assumptions
-    assert self.params.task_index == 0
-    assert not self.params.eval
-    assert not self.params.forward_only
-    assert not self.params.staged_vars
 
-    tf.set_random_seed(self.params.tf_random_seed)
-    np.random.seed(4321)
-    phase_train = True
-
-    log_fn('Generating model')
-    losses = []
-    device_grads = []
-    all_logits = []
-    all_top_1_ops = []
-    all_top_5_ops = []
-    enqueue_ops = []
-    gpu_compute_stage_ops = []
-    gpu_grad_stage_ops = []
-
-    with tf.device(self.global_step_device):
-      global_step = tf.train.get_or_create_global_step()
-
-    update_ops = []
-    global_image_producer_ops = []
-
-    is_local = not self.job_name
-    if is_local:
-      assert self.num_workers == 1
-    for task_num in range(self.num_workers):
-      # Reset the devices that self.variable_mgr knows about to those
-      # belonging to the next worker (task).
-      self.reset_devices_for_task(task_num, is_local)
-      # Build the per-worker image processing
-      (image_producer_ops, image_producer_stages) = (
-          self._build_image_processing(
-              shift_ratio=(float(task_num) / self.num_workers)))
-      global_image_producer_ops.extend(image_producer_ops)
-      # Build the per-worker model replica.
-      for rel_device_num in range(len(self.devices)):
-        abs_device_num = task_num * len(self.devices) + rel_device_num
-        with self.variable_mgr.create_outer_variable_scope(
-            abs_device_num), tf.name_scope(
-                'task_%i_tower_%i' % (task_num, rel_device_num)) as name_scope:
-          task_results = self.add_forward_pass_and_gradients(
-              phase_train, rel_device_num, abs_device_num,
-              image_producer_stages[rel_device_num], gpu_compute_stage_ops,
-              gpu_grad_stage_ops)
-          if phase_train:
-            losses.append(task_results['loss'])
-            device_grads.append(task_results['gradvars'])
-          else:
-            all_logits.append(task_results['logits'])
-          if not phase_train or self.params.print_training_accuracy:
-            all_top_1_ops.append(task_results['top_1_op'])
-            all_top_5_ops.append(task_results['top_5_op'])
-
-          if rel_device_num == 0:
-            # Retain the Batch Normalization updates operations only
-            # from the first tower. These operations update the moving
-            # mean and moving variance variables, which are updated
-            # (but not used) during training, and used during
-            # evaluation. The moving mean and variance approximate the
-            # true mean and variance across all images in the
-            # dataset. Therefore, in replicated mode, these moving
-            # averages would be almost identical for each tower, and
-            # so we only update and save the moving averages for one
-            # tower. In parameter server mode, all towers share a copy
-            # of the variables so we also only need to update and save
-            # the moving averages once.
-            update_ops.extend(
-                tf.get_collection(tf.GraphKeys.UPDATE_OPS, name_scope))
-            assert not self.variable_mgr.staging_delta_ops
-
-    enqueue_ops.append(tf.group(*gpu_compute_stage_ops))
-    assert not self.variable_mgr.supports_staged_vars()
-    assert not gpu_grad_stage_ops
-
-    fetches = self._build_fetches(global_step, all_logits, losses, device_grads,
-                                  enqueue_ops, update_ops, all_top_1_ops,
-                                  all_top_5_ops, phase_train)
-    global_image_producer_ops = tf.group(*global_image_producer_ops)
-    return (global_image_producer_ops, enqueue_ops, fetches)
 
   def add_forward_pass_and_gradients(self, phase_train, rel_device_num,
                                      abs_device_num, image_producer_stage,

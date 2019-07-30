@@ -25,7 +25,7 @@ from tensorflow.contrib.image.python.ops import distort_image_ops
 from tensorflow.python.layers import utils
 from tensorflow.python.ops import data_flow_ops
 from tensorflow.python.platform import gfile
-import cnn_util
+#import cnn_util
 
 
 def parse_example_proto(example_serialized):

@@ -902,8 +902,8 @@ class BenchmarkCNN(object):
       log_fn('total images/sec: %.2f' % images_per_sec)
       log_fn('-' * 64)
       image_producer.done()
-      if is_chief:
-        store_benchmarks({'total_images_per_sec': images_per_sec}, self.params)
+      #if is_chief:
+      #  store_benchmarks({'total_images_per_sec': images_per_sec}, self.params)
       # Save the model checkpoint.
       
     sv.stop()

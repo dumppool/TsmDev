@@ -33,6 +33,7 @@ flags.adopt_module_key_flags(benchmark_cnn)
 
 def main(_):
   params = benchmark_cnn.make_params_from_flags()
+  print(params)
   params = benchmark_cnn.setup(params)
   bench = benchmark_cnn.BenchmarkCNN(params)
 

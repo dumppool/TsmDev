@@ -1,18 +1,3 @@
-# Copyright 2017 The TensorFlow Authors. All Rights Reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-# ==============================================================================
-"""Utilities for VariableMgr."""
 
 from __future__ import print_function
 
@@ -46,44 +31,6 @@ AutoLossScaleParams = pycoll.namedtuple(
     ])
 
 
-def get_loss_scale_update_op(loss_scale, loss_scale_normal_steps,
-                             inc_loss_scale_every_n):
-  """Returns the update op for loss scaling variables.
-
-  We maintain the counter `loss_scale_normal_steps` to count the number of steps
-  we have been using the current `loss_scale`. In most cases, this function
-  increments `loss_scale_normal_steps`. However, if `loss_scale_normal_steps` is
-  greater than the threshold `inc_loss_scale_every_n`, we double `loss_scale`
-  and reset `loss_scale_normal_steps` to zero.
-
-  This op is only called if the gradients don't have any infs or nans. Instead,
-  if infs or nans occur in the gradients, we immeditately halve `loss_scale` and
-  reset `loss_scale_normal_steps` to zero.
-
-  Args:
-    loss_scale: a tf.Variable represneting the loss_scale value.
-    loss_scale_normal_steps: a tf.Variable representing the number of training
-      steps that have run since the loss_scale last changed.
-    inc_loss_scale_every_n: a Python integer threshold. `loss_scale` is
-      increased every `inc_loss_scale_every_n` steps, unless the gradients have
-      infs or nans.
-
-  Returns:
-    An op for updating `loss_scale` and `loss_scale_normal_steps`.
-  """
-
-  def increment_loss_scale_normal_steps_func():
-    return tf.group(loss_scale_normal_steps.assign_add(1))
-
-  def increase_loss_scale_func():
-    return tf.group(
-        tf.assign(loss_scale_normal_steps, 0),
-        tf.assign(loss_scale, loss_scale * 2))
-
-  # true_fn and false_fn must have the same type.
-  return tf.cond(loss_scale_normal_steps < inc_loss_scale_every_n,
-                 increment_loss_scale_normal_steps_func,
-                 increase_loss_scale_func)
 
 
 def append_gradients_with_loss_scale(training_ops, get_apply_gradients_ops_func,
@@ -166,27 +113,7 @@ class OverrideCachingDevice(object):
     return var
 
 
-# To be used with custom_getter on tf.get_variable. Ensures the created variable
-# is in LOCAL_VARIABLES and not GLOBAL_VARIBLES collection.
-class OverrideToLocalVariableIfNotPsVar(object):
 
-  # args and kwargs come from the custom_getter interface for Tensorflow
-  # variables, and matches tf.get_variable's signature, with the addition of
-  # 'getter' at the beginning.
-  def __call__(self, getter, name, *args, **kwargs):
-    if name.startswith(PS_SHADOW_VAR_PREFIX):
-      return getter(*args, **kwargs)
-
-    if 'collections' in kwargs:
-      collections = kwargs['collections']
-    if not collections:
-      collections = [tf.GraphKeys.GLOBAL_VARIABLES]
-    else:
-      collections = collections[:]
-    collections.remove(tf.GraphKeys.GLOBAL_VARIABLES)
-    collections.append(tf.GraphKeys.LOCAL_VARIABLES)
-    kwargs['collections'] = list(collections)
-    return getter(name, *args, **kwargs)
 
 
 class ParamServerDeviceSetter(object):
@@ -378,39 +305,6 @@ class StagedVariableGetter(object):
     return params
 
 
-def aggregate_gradients_using_copy_with_device_selection(
-    benchmark_cnn, tower_grads, use_mean, check_inf_nan):
-  """Aggregate gradients, controlling device for the aggregation.
-
-  Args:
-    benchmark_cnn: benchmark_cnn class.
-    tower_grads: List of lists of (gradient, variable) tuples. The outer list
-      is over towers. The inner list is over individual gradients.
-    use_mean: if True, mean is taken, else sum of gradients is taken.
-    check_inf_nan: If true, check grads for nans and infs.
-
-  Returns:
-    The tuple ([(average_gradient, variable),], has_nan_or_inf) where the
-      gradient has been averaged across all towers. The variable is chosen from
-      the first tower. The has_nan_or_inf indicates the grads has nan or inf.
-  """
-  if benchmark_cnn.local_parameter_device_flag == 'gpu':
-    avail_devices = benchmark_cnn.raw_devices
-  else:
-    avail_devices = [benchmark_cnn.param_server_device]
-  agg_grads = []
-  has_nan_or_inf_list = []
-  for i, single_grads in enumerate(zip(*tower_grads)):
-    with tf.device(avail_devices[i % len(avail_devices)]):
-      grad_and_var, has_nan_or_inf = aggregate_single_gradient_using_copy(
-          single_grads, use_mean, check_inf_nan)
-      agg_grads.append(grad_and_var)
-      has_nan_or_inf_list.append(has_nan_or_inf)
-  if check_inf_nan:
-    return agg_grads, tf.reduce_any(has_nan_or_inf_list)
-  else:
-    return agg_grads, None
-
 
 def aggregate_gradients_using_copy_with_variable_colocation(
     tower_grads, use_mean, check_inf_nan):
@@ -451,35 +345,7 @@ def aggregate_gradients_using_copy_with_variable_colocation(
     return agg_grads, None
 
 
-def aggregate_gradients_using_copy(tower_grads, use_mean, check_inf_nan):
-  """Calculate the average gradient for each shared variable across all towers.
 
-  Note that this function provides a synchronization point across all towers.
-
-  Args:
-    tower_grads: List of lists of (gradient, variable) tuples. The outer list
-      is over towers. The inner list is over individual gradients.
-    use_mean: if True, mean is taken, else sum of gradients is taken.
-    check_inf_nan: check grads for nans and infs.
-
-  Returns:
-    The tuple ([(average_gradient, variable),], has_nan_or_inf) where the
-      gradient has been averaged across all towers. The variable is chosen from
-      the first tower. The has_nan_or_inf indicates the grads has nan or inf.
-  """
-  agg_grads = []
-  has_nan_or_inf_list = []
-
-  for single_grads in zip(*tower_grads):
-    grad_and_var, has_nan_or_inf = aggregate_single_gradient_using_copy(
-        single_grads, use_mean, check_inf_nan)
-    agg_grads.append(grad_and_var)
-    has_nan_or_inf_list.append(has_nan_or_inf)
-
-  if check_inf_nan:
-    return agg_grads, tf.reduce_any(has_nan_or_inf_list)
-  else:
-    return agg_grads, None
 
 
 def aggregate_single_gradient_using_copy(grad_and_vars, use_mean,
@@ -508,8 +374,4 @@ def aggregate_single_gradient_using_copy(grad_and_vars, use_mean,
     grad = tf.multiply(grad, 1.0 / len(grads))
 
   v = grad_and_vars[0][1]
-  if check_inf_nan:
-    has_nan_or_inf = tf.logical_not(tf.reduce_all(tf.is_finite(grads)))
-    return (grad, v), has_nan_or_inf
-  else:
-    return (grad, v), None
+  return (grad, v), None

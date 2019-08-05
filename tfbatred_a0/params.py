@@ -37,7 +37,7 @@ _DEFAULT_PARAMS = {
                   'number of groups of batches processed in the image '
                   'producer.'),
     'num_batches':
-        ParamSpec('integer', 200, 'number of batches to run, excluding '
+        ParamSpec('integer', 40, 'number of batches to run, excluding '
                   'warmup'),
     'num_warmup_batches':
         ParamSpec('integer', None, 'number of batches to run before timing'),

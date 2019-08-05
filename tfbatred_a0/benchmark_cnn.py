@@ -405,7 +405,8 @@ class BenchmarkCNN(object):
             sess, global_step,
             self.num_workers * self.num_warmup_batches +
             self.init_global_step,
-            self.num_workers * (self.num_warmup_batches + self.num_batches) - 1)
+            self.num_workers * (self.num_warmup_batches + self.num_batches) - 1 )
+            #self.num_workers * (self.num_warmup_batches + 56) - 1)#(self.num_warmup_batches + self.num_batches) - 1)
         global_step_watcher.start()
       
 
